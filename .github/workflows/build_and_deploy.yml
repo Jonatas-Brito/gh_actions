@@ -1,0 +1,301 @@
+name: Build and Deploy
+
+on:
+  workflow_call:
+    inputs:
+      project_name:
+        required: true
+        type: string
+        description: "Nome do projeto (usado para logs e artefatos)"
+      bundle_id_android:
+        required: true
+        type: string
+        description: "Bundle ID para Android (ex: com.example.app)"
+      bundle_id_ios:
+        required: true
+        type: string
+        description: "Bundle Identifier para iOS (ex: com.example.app)"
+      flutter_version:
+        required: true
+        type: string
+        description: "Versão do Flutter a ser utilizada"
+      platform:
+        required: false
+        type: string
+        default: 'all'
+        description: "Plataforma para build e deploy ('android', 'ios', ou 'all')"
+    secrets:
+      PLAY_STORE_SERVICE_ACCOUNT_JSON:
+        required: false
+        description: "JSON da conta de serviço do Google Play Store"
+      KEYSTORE:
+        required: false
+        description: "Conteúdo base64 do keystore Android"
+      ANDROID_KEYSTORE_PASSWORD:
+        required: false
+        description: "Senha do keystore Android"
+      ANDROID_KEYSTORE_ALIAS:
+        required: false
+        description: "Alias da chave no keystore Android"
+      ANDROID_KEYSTORE_PRIVATE_KEY_PASSWORD:
+        required: false
+        description: "Senha da chave privada no keystore Android"
+      CERTIFICATE_BASE64:
+        required: false
+        description: "Conteúdo base64 do certificado iOS (.p12)"
+      P12_PASSWORD:
+        required: false
+        description: "Senha do certificado iOS (.p12)"
+      PROVISIONING_PROFILE_BASE64:
+        required: false
+        description: "Conteúdo base64 do provisioning profile iOS (.mobileprovision)"
+      KEYCHAIN_PASSWORD:
+        required: false
+        description: "Senha do keychain iOS"
+      APPSTORE_API_PRIVATE_KEY_BASE64:
+        required: false
+        description: "Conteúdo base64 da chave privada da API da App Store Connect (.p8)"
+      APPSTORE_API_KEY_ID:
+        required: false
+        description: "ID da chave da API da App Store Connect"
+      APPSTORE_ISSUER_ID:
+        required: false
+        description: "ID do emissor da API da App Store Connect"
+      SSH_PRIVATE_KEY_ONLYPAY_PACKAGE:
+        required: false
+        description: "Chave SSH privada para pacotes (se necessário)"
+      # GITHUB_TOKEN:
+      #   required: false
+      #   default: ""
+      #   description: "Token do GitHub para ações que precisam de autenticação"
+
+jobs:
+  prepare-version:
+    name: 🔢 Prepare Version
+    runs-on: ubuntu-latest
+
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      build_number: ${{ steps.get_version.outputs.build_number }}
+      version_with_build: ${{ steps.get_version.outputs.version_with_build }}
+
+    steps:
+      - name: 📚 Git Checkout
+        uses: actions/checkout@v4
+
+      - name: 🔍 Extract version from pubspec.yaml
+        id: get_version
+        run: |
+          VERSION=$(grep 'version:' pubspec.yaml | cut -d ' ' -f2 | cut -d '+' -f1)
+          BUILD_NUMBER=$(grep 'version:' pubspec.yaml | cut -d '+' -f2)
+          PATCH=$(echo $VERSION | awk -F. '{print $3}')
+          NEW_PATCH=$((PATCH + 1))
+          NEW_BUILD=$((BUILD_NUMBER + 1))
+          NEW_VERSION=$(echo $VERSION | sed "s/\.[0-9]*$/.${NEW_PATCH}/")
+          NEW_VERSION_WITH_BUILD=$NEW_VERSION+$NEW_BUILD
+
+          echo "Version: $NEW_VERSION"
+          echo "Build: $NEW_BUILD"
+          echo "Version with Build (Debug): $NEW_VERSION_WITH_BUILD"
+
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "build_number=$NEW_BUILD" >> "$GITHUB_OUTPUT"
+          echo "version_with_build=$NEW_VERSION_WITH_BUILD" >> "$GITHUB_OUTPUT"
+
+  build-app-bundle:
+    name: 🤖 Build Flutter (Android)
+    needs: [prepare-version]
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📚 Git Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐦 Setup Flutter
+        uses: ./.github/actions/setup-flutter
+        with:
+          flutter_version: ${{ inputs.flutter_version }}
+          flutter_channel: stable
+          ssh_private_key_onlypay_package: ${{ secrets.SSH_PRIVATE_KEY_ONLYPAY_PACKAGE }}
+
+      - name: 🪄 Decode Keystore
+        id: write_file
+        uses: timheuer/base64-to-file@v1
+        with:
+          fileName: "app-keystore.jks"
+          fileDir: './android/'
+          encodedString: ${{ secrets.KEYSTORE }}
+
+      - name: 🔑 Generate Key Properties File
+        run: |
+          cd android
+          export STORE_FILE_PATH=$(pwd)/app-keystore.jks
+          export ANDROID_KEYSTORE_PASSWORD=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          export ANDROID_KEYSTORE_ALIAS=${{ secrets.ANDROID_KEYSTORE_ALIAS }}
+          export ANDROID_KEYSTORE_PRIVATE_KEY_PASSWORD=${{ secrets.ANDROID_KEYSTORE_PRIVATE_KEY_PASSWORD }}
+          echo -e "storePassword=$ANDROID_KEYSTORE_PASSWORD\nkeyAlias=$ANDROID_KEYSTORE_ALIAS\nkeyPassword=$ANDROID_KEYSTORE_PRIVATE_KEY_PASSWORD\nstoreFile=$STORE_FILE_PATH" > key.properties
+
+      - name: 💪 Build App Bundle
+        run: flutter build appbundle --release --build-name=${{ needs.prepare-version.outputs.version }} --build-number=${{ needs.prepare-version.outputs.build_number }}
+
+      - name: 📤 Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.project_name }}-android-release
+          path: build/app/outputs/bundle/release/
+
+  publish-play-store:
+    name: 📲 Publish to Play Store
+    needs: [build-app-bundle, prepare-version]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📚 Git Checkout
+        uses: actions/checkout@v4
+
+      - name: 📥 Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.project_name }}-android-release
+
+      - name: 🚀 Deploy to Play Store
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_STORE_SERVICE_ACCOUNT_JSON }}
+          packageName: ${{ inputs.bundle_id_android }}
+          releaseFiles: app-release.aab
+          track: internal
+          status: completed
+          releaseName: "(${{ needs.prepare-version.outputs.build_number }}) ${{ needs.prepare-version.outputs.version }}"
+
+  build-ios:
+    name: 🍎 Build Flutter (iOS)
+    needs: [prepare-version]
+    runs-on: macos-latest
+    steps:
+      - name: 📚 Git Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐦 Setup Flutter
+        uses: ./.github/actions/setup-flutter
+        with:
+          flutter_version: ${{ inputs.flutter_version }}
+          flutter_channel: stable
+          ssh_private_key_onlypay_package: ${{ secrets.SSH_PRIVATE_KEY_ONLYPAY_PACKAGE }}
+
+      - name: 🔄 Update iOS version in project.pbxproj
+        run: |
+          sed -i '' "s/MARKETING_VERSION = [0-9.]*;/MARKETING_VERSION = ${{ needs.prepare-version.outputs.version }};/" ios/Runner.xcodeproj/project.pbxproj
+          sed -i '' "s/CURRENT_PROJECT_VERSION = [0-9]*;/CURRENT_PROJECT_VERSION = ${{ needs.prepare-version.outputs.build_number }};/" ios/Runner.xcodeproj/project.pbxproj
+
+      - name: 🪄 Install the Apple certificate and provisioning profile
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          PROVISIONING_PROFILE_BASE64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          # Create variables for paths
+          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+          PP_PATH=$RUNNER_TEMP/build_pp.mobileprovision
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+          # Decode and store the certificate and provisioning profile from secrets
+          echo -n "$CERTIFICATE_BASE64" | base64 --decode --output $CERTIFICATE_PATH
+          echo -n "$PROVISIONING_PROFILE_BASE64" | base64 --decode --output $PP_PATH
+
+          # Create a temporary keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          # Import the certificate into the keychain
+          security import $CERTIFICATE_PATH -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH
+
+          # Apply provisioning profile
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles
+
+          # Verify the provisioning profile is correctly applied
+          cd ~/Library/MobileDevice/Provisioning\ Profiles
+          ls -la
+          
+      - name: 📤 Upload mobile provisioning
+        uses: actions/upload-artifact@v4
+        with:
+          name: build_pp.mobileprovision
+          path: ~/Library/MobileDevice/Provisioning\ Profiles/build_pp.mobileprovision
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: 💪 Build App IPA
+        run: flutter build ipa --release --export-options-plist=ios/Runner/ExportOptionsApple.plist
+
+      - name: 📤 Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.project_name }}-ios-release
+          path: build/ios/ipa/*.ipa
+          retention-days: 1
+          if-no-files-found: error
+      - name: 🧹 Clean up keychain and provisioning profile
+        if: ${{ always() }}
+        run: |
+          security delete-keychain $RUNNER_TEMP/app-signing.keychain-db
+          rm ~/Library/MobileDevice/Provisioning\ Profiles/build_pp.mobileprovision
+
+  publish-apple-store:
+    name: 📲 Publish to TestFlight (Apple Store)
+    needs: [build-ios]
+    runs-on: macos-latest
+    steps:
+      - name: 📚 Git Checkout
+        uses: actions/checkout@v4
+
+      - name: 📥 Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.project_name }}-ios-release
+      - name: 🔑 Install private API key P8
+        env:
+          PRIVATE_API_KEY_BASE64: ${{ secrets.APPSTORE_API_PRIVATE_KEY_BASE64 }}
+          API_KEY: ${{ secrets.APPSTORE_API_KEY_ID }}
+        run: |
+          mkdir -p ~/private_keys
+          echo -n "$PRIVATE_API_KEY_BASE64" | base64 --decode --output AuthKey_$API_KEY.p8
+          cp *.p8 ~/private_keys
+
+      - name: 🚀 Upload app to TestFlight
+        env:
+          API_KEY: ${{ secrets.APPSTORE_API_KEY_ID }}
+          API_ISSUER: ${{ secrets.APPSTORE_ISSUER_ID  }}
+        run: xcrun altool --output-format xml --upload-app --type ios -f build/ios/ipa/*.ipa --apiKey $API_KEY --apiIssuer $API_ISSUER
+
+  update-version:
+    name: 🔄 Update pubspec.yaml Version
+    runs-on: ubuntu-latest
+    needs: [publish-play-store, publish-apple-store]
+    if: success()
+    steps:
+      - name: 📚 Git Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: 📝 Update pubspec.yaml
+        run: |
+          BRANCH_NAME="${{ github.head_ref }}"
+          echo "Branch detectada: $BRANCH_NAME"
+
+          git checkout $BRANCH_NAME
+
+          sed -i "s/version: .*/version: ${{ needs.prepare-version.outputs.version_with_build }}/" pubspec.yaml
+
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+          git add pubspec.yaml
+          git commit -m "chore: update project version to ${{ needs.prepare-version.outputs.version_with_build }}"
+          git push origin $BRANCH_NAME
